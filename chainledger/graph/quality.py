@@ -9,6 +9,7 @@ from ..types import (
     canonical,
     decode,
     fingerprint,
+    timestamp,
     fail,
 )
 
@@ -27,6 +28,10 @@ class QualityRelease:
                 payload TEXT NOT NULL,PRIMARY KEY(inspection,id))""")
             con.execute("""CREATE TABLE IF NOT EXISTS quality_dispositions(id TEXT PRIMARY KEY,inspection TEXT NOT NULL,
                 payload TEXT NOT NULL)""")
+            con.execute("""CREATE TABLE IF NOT EXISTS inspection_rechecks(inspection TEXT NOT NULL,sample TEXT NOT NULL,
+                id TEXT NOT NULL,recorded_at TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(inspection,sample,id))""")
+            con.execute("""CREATE TABLE IF NOT EXISTS inspection_withdrawals(inspection TEXT NOT NULL,sample TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(inspection,sample))""")
 
     def specification(self, data):
         obj(
@@ -142,9 +147,35 @@ class QualityRelease:
             ],
         }
 
-    def sample(self, inspection_id, sample_id, measurements, expected_revision):
-        key(sample_id)
+    def _measurements(self, spec, measurements):
         obj(measurements)
+        names = {item["name"] for item in spec["criteria"]}
+        if set(measurements) != names:
+            fail("input", "sample must cover exactly specified criteria")
+        normalized = {}
+        failures = []
+        for criterion in spec["criteria"]:
+            item = measurements[criterion["name"]]
+            obj(item, {"value", "unit"}, {"value", "unit"})
+            if item["unit"] != criterion["unit"]:
+                fail("unit", "sample unit differs from inspection specification")
+            value = amount(item["value"], allow_zero=True)
+            normalized[criterion["name"]] = {
+                "value": text(value),
+                "unit": item["unit"],
+            }
+            if (
+                not Decimal(criterion["lower"])
+                <= value
+                <= Decimal(criterion["upper"])
+            ):
+                failures.append(criterion["name"])
+        return normalized, failures
+
+    def sample(self, inspection_id, sample_id, measurements, expected_revision, sampling="convenience"):
+        key(sample_id)
+        if sampling not in ("convenience", "random"):
+            fail("input", "unknown sampling method", sampling=sampling)
         with self.journal.transaction() as con:
             inspection = self.get(inspection_id)
             if (
@@ -153,31 +184,12 @@ class QualityRelease:
             ):
                 fail("conflict", "inspection state or revision changed")
             spec = self.spec(inspection["spec"])
-            names = {item["name"] for item in spec["criteria"]}
-            if set(measurements) != names:
-                fail("input", "sample must cover exactly specified criteria")
-            normalized = {}
-            failures = []
-            for criterion in spec["criteria"]:
-                item = measurements[criterion["name"]]
-                obj(item, {"value", "unit"}, {"value", "unit"})
-                if item["unit"] != criterion["unit"]:
-                    fail("unit", "sample unit differs from inspection specification")
-                value = amount(item["value"], allow_zero=True)
-                normalized[criterion["name"]] = {
-                    "value": text(value),
-                    "unit": item["unit"],
-                }
-                if (
-                    not Decimal(criterion["lower"])
-                    <= value
-                    <= Decimal(criterion["upper"])
-                ):
-                    failures.append(criterion["name"])
+            normalized, failures = self._measurements(spec, measurements)
             payload = {
                 "id": sample_id,
                 "measurements": normalized,
                 "failed_criteria": failures,
+                "sampling": sampling,
             }
             old = self.journal.one(
                 "SELECT payload FROM inspection_samples WHERE inspection=? AND id=?",
@@ -199,6 +211,89 @@ class QualityRelease:
             )
             self.journal.record("inspection_sample", inspection_id, payload)
         return self.get(inspection_id)
+
+    def recheck(
+        self,
+        inspection_id,
+        sample_id,
+        recheck_id,
+        measurements,
+        recorded_at,
+        supersedes=False,
+    ):
+        key(recheck_id)
+        recorded_at = timestamp(recorded_at)
+        if not isinstance(supersedes, bool):
+            fail("input", "recheck supersession must be an explicit boolean")
+        with self.journal.transaction() as con:
+            inspection = self.get(inspection_id)
+            target = self.journal.one(
+                "SELECT payload FROM inspection_samples WHERE inspection=? AND id=?",
+                (inspection_id, sample_id),
+            )
+            if target is None:
+                fail("missing", "inspection sample not found")
+            spec = self.spec(inspection["spec"])
+            normalized, failures = self._measurements(spec, measurements)
+            payload = {
+                "id": recheck_id,
+                "inspection": inspection_id,
+                "sample": sample_id,
+                "measurements": normalized,
+                "failed_criteria": failures,
+                "supersedes": supersedes,
+                "recorded_at": recorded_at,
+            }
+            old = self.journal.one(
+                "SELECT payload FROM inspection_rechecks WHERE inspection=? AND sample=? AND id=?",
+                (inspection_id, sample_id, recheck_id),
+            )
+            if old:
+                if old["payload"] != canonical(payload):
+                    fail("conflict", "recheck identity differs")
+                return decode(old["payload"])
+            con.execute(
+                "INSERT INTO inspection_rechecks VALUES(?,?,?,?,?)",
+                (inspection_id, sample_id, recheck_id, recorded_at, canonical(payload)),
+            )
+            self.journal.record("inspection_recheck", recheck_id, payload)
+        return payload
+
+    def withdraw_sample(self, inspection_id, sample_id, recorded_at, reason):
+        recorded_at = timestamp(recorded_at)
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 512:
+            fail("input", "withdrawal requires a bounded reason")
+        with self.journal.transaction() as con:
+            self.get(inspection_id)
+            target = self.journal.one(
+                "SELECT payload FROM inspection_samples WHERE inspection=? AND id=?",
+                (inspection_id, sample_id),
+            )
+            if target is None:
+                fail("missing", "inspection sample not found")
+            payload = {
+                "inspection": inspection_id,
+                "sample": sample_id,
+                "recorded_at": recorded_at,
+                "reason": reason.strip(),
+            }
+            old = self.journal.one(
+                "SELECT recorded_at,reason FROM inspection_withdrawals WHERE inspection=? AND sample=?",
+                (inspection_id, sample_id),
+            )
+            if old:
+                if (old["recorded_at"], old["reason"]) != (
+                    recorded_at,
+                    reason.strip(),
+                ):
+                    fail("conflict", "withdrawal identity differs")
+                return payload
+            con.execute(
+                "INSERT INTO inspection_withdrawals VALUES(?,?,?,?)",
+                (inspection_id, sample_id, recorded_at, reason.strip()),
+            )
+            self.journal.record("inspection_withdrawn", inspection_id, payload)
+        return payload
 
     def evaluate(self, inspection_id):
         inspection = self.get(inspection_id)

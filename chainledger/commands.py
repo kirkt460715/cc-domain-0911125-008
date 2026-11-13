@@ -104,8 +104,26 @@ def dispatch(app, request):
         return app.quality.evaluate(values["id"])
     if action == "inspection_disposition":
         return app.quality.disposition(**values)
+    if action == "inspection_recheck":
+        return app.quality.recheck(**values)
+    if action == "inspection_withdraw":
+        return app.quality.withdraw_sample(**values)
     if action == "supplier_quality":
         return app.quality.supplier_summary(values["supplier"])
+    if action == "quality_study":
+        return app.studies.create(values["study"])
+    if action == "quality_study_get":
+        return app.studies.get(values["id"])
+    if action == "quality_study_list":
+        return app.studies.list()
+    if action == "quality_study_export":
+        return app.studies.export(values["id"], values["path"])
+    if action == "quality_study_compare":
+        return app.studies.compare(values["first"], values["second"])
+    if action == "quality_study_verify":
+        from .analysis.study import verify_study
+
+        return verify_study(values["path"])
     if action == "packet":
         return app.packets.create(values["id"], values["shipment"])
     if action == "packet_export":
@@ -130,7 +148,7 @@ def dispatch(app, request):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="chainledger")
     parser.add_argument("--db", default="chainledger.sqlite3")
-    parser.add_argument("command", choices=["run", "demo", "check", "pending"])
+    parser.add_argument("command", choices=["run", "demo", "check", "pending", "study"])
     parser.add_argument("file", nargs="?")
     args = parser.parse_args(argv)
     try:
@@ -138,6 +156,10 @@ def main(argv=None):
             from .demonstration import run
 
             result = run()
+        elif args.command == "study":
+            from .demonstration import study_walkthrough
+
+            result = study_walkthrough()
         else:
             with SupplyChain(args.db) as app:
                 if args.command == "run":

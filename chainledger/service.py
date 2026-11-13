@@ -1,4 +1,5 @@
 from .graph.quality import QualityRelease
+from .analysis.study import QualityStudy
 from .views.packets import ShipmentPackets
 from .views.picking import Picking
 from .journal import Journal
@@ -25,6 +26,7 @@ class SupplyChain:
         self.inventory = Inventory(self.journal, self.graph)
         self.exchange = Exchange(self.journal, self.consumer)
         self.quality = QualityRelease(self.journal, self.graph)
+        self.studies = QualityStudy(self.journal)
         self.packets = ShipmentPackets(self.journal, self.graph, self.trace)
         self.picking = Picking(self.journal, self.graph, self.consumer)
 
